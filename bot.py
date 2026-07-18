@@ -41,6 +41,8 @@ GAME_SHORT = os.environ.get("GAME_SHORT", "game_short")
 PORT = int(os.environ.get("PORT", "8080"))
 PUBLIC_URL = os.environ["PUBLIC_URL"].rstrip("/")
 DB_PATH = os.environ.get("DB_PATH", "/tmp/scores.db")
+# Your Telegram numeric user id, allowed to run /reset_all. Optional.
+OWNER_ID = os.environ.get("OWNER_ID", "").strip()
 
 application = Application.builder().token(BOT_TOKEN).build()
 
@@ -104,6 +106,24 @@ def top_scores(chat_id, limit=15):
     return [{"name": r[0], "score": r[1]} for r in rows]
 
 
+def clear_chat(chat_id):
+    conn = db()
+    cur = conn.execute("DELETE FROM scores WHERE chat_id=?", (str(chat_id),))
+    n = cur.rowcount
+    conn.commit()
+    conn.close()
+    return n
+
+
+def clear_all():
+    conn = db()
+    cur = conn.execute("DELETE FROM scores")
+    n = cur.rowcount
+    conn.commit()
+    conn.close()
+    return n
+
+
 # ---------------- bot commands ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -116,6 +136,43 @@ async def play(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_game(
         chat_id=update.effective_chat.id,
         game_short_name=GAME_SHORT,
+    )
+
+
+async def _is_chat_admin(update, context):
+    """True if the sender is an admin/creator of the current chat, or in a private chat."""
+    chat = update.effective_chat
+    if chat.type == "private":
+        return True
+    try:
+        member = await context.bot.get_chat_member(chat.id, update.effective_user.id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+
+async def reset_scores(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Clear the leaderboard of THIS chat. Allowed for chat admins or the owner."""
+    uid = str(update.effective_user.id)
+    if not (uid == OWNER_ID or await _is_chat_admin(update, context)):
+        await update.message.reply_text("Скинути таблицю може лише адмін чату.")
+        return
+    n = clear_chat(update.effective_chat.id)
+    await update.message.reply_text(
+        f"Таблицю лідерів цього чату очищено (видалено записів: {n}). "
+        "Нові рекорди почнуться з чистого аркуша."
+    )
+
+
+async def reset_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Clear ALL leaderboards in every chat. Owner only."""
+    uid = str(update.effective_user.id)
+    if not OWNER_ID or uid != OWNER_ID:
+        await update.message.reply_text("Ця команда доступна лише власнику бота.")
+        return
+    n = clear_all()
+    await update.message.reply_text(
+        f"Усі таблиці лідерів очищено (видалено записів: {n})."
     )
 
 
@@ -216,6 +273,8 @@ async def post_init(app):
 def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("play", play))
+    application.add_handler(CommandHandler("reset_scores", reset_scores))
+    application.add_handler(CommandHandler("reset_all", reset_all))
     application.add_handler(CallbackQueryHandler(game_callback))
     application.post_init = post_init
     application.run_polling()
