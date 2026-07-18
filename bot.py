@@ -19,6 +19,7 @@ Env vars:
 """
 
 import os
+import time
 import logging
 import sqlite3
 from urllib.parse import urlencode
@@ -59,13 +60,31 @@ def db():
             PRIMARY KEY (chat_id, user_id)
         )
     """)
+    # journal of every play, with a timestamp, for time-window leaderboards
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS plays (
+            chat_id TEXT,
+            user_id TEXT,
+            name    TEXT,
+            score   INTEGER,
+            ts      INTEGER
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_plays ON plays(chat_id, ts)")
     return conn
 
 
 def save_best(chat_id, user_id, name, score):
-    """Insert or update, keeping only the highest score per user per chat.
-    Returns True if this was a new best."""
+    """Keep best-per-user in `scores`, and log every play in `plays` (with time).
+    Returns True if this was a new all-time best."""
     conn = db()
+    now = int(time.time())
+    # log the play
+    conn.execute(
+        "INSERT INTO plays (chat_id, user_id, name, score, ts) VALUES (?,?,?,?,?)",
+        (str(chat_id), str(user_id), name, int(score), now),
+    )
+    # update all-time best
     cur = conn.execute(
         "SELECT best FROM scores WHERE chat_id=? AND user_id=?",
         (str(chat_id), str(user_id)),
@@ -85,7 +104,6 @@ def save_best(chat_id, user_id, name, score):
         )
         is_new_best = True
     else:
-        # keep name fresh even if score not beaten
         conn.execute(
             "UPDATE scores SET name=? WHERE chat_id=? AND user_id=?",
             (name, str(chat_id), str(user_id)),
@@ -106,10 +124,43 @@ def top_scores(chat_id, limit=15):
     return [{"name": r[0], "score": r[1]} for r in rows]
 
 
+def week_top(chat_id, days=7, limit=10):
+    """Best score per user within the last `days` days, in this chat."""
+    conn = db()
+    since = int(time.time()) - days * 86400
+    cur = conn.execute(
+        """
+        SELECT name, MAX(score) AS best
+        FROM plays
+        WHERE chat_id=? AND ts>=?
+        GROUP BY user_id
+        ORDER BY best DESC
+        LIMIT ?
+        """,
+        (str(chat_id), since, limit),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [{"name": r[0], "score": r[1]} for r in rows]
+
+
+def active_chats(days=7):
+    """Chats that had at least one play in the window (for weekly auto-post)."""
+    conn = db()
+    since = int(time.time()) - days * 86400
+    cur = conn.execute(
+        "SELECT DISTINCT chat_id FROM plays WHERE ts>=?", (since,)
+    )
+    rows = [r[0] for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
 def clear_chat(chat_id):
     conn = db()
     cur = conn.execute("DELETE FROM scores WHERE chat_id=?", (str(chat_id),))
     n = cur.rowcount
+    conn.execute("DELETE FROM plays WHERE chat_id=?", (str(chat_id),))
     conn.commit()
     conn.close()
     return n
@@ -119,6 +170,7 @@ def clear_all():
     conn = db()
     cur = conn.execute("DELETE FROM scores")
     n = cur.rowcount
+    conn.execute("DELETE FROM plays")
     conn.commit()
     conn.close()
     return n
@@ -137,6 +189,25 @@ async def play(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=update.effective_chat.id,
         game_short_name=GAME_SHORT,
     )
+
+
+def format_week(rows):
+    if not rows:
+        return "За останній тиждень ще ніхто не грав. Напишіть /play і почніть!"
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🏆 Підсумок тижня — Ping Boot\nТоп гравців за 7 днів:\n"]
+    for i, r in enumerate(rows):
+        tag = medals[i] if i < 3 else f"{i+1}."
+        lines.append(f"{tag} {r['name']} — {r['score']}")
+    champ = rows[0]
+    lines.append(f"\nЧемпіон тижня: {champ['name']} 👑")
+    return "\n".join(lines)
+
+
+async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the last-7-days leaderboard for this chat, on demand."""
+    rows = week_top(update.effective_chat.id, days=7, limit=10)
+    await update.message.reply_text(format_week(rows))
 
 
 async def _is_chat_admin(update, context):
@@ -270,13 +341,43 @@ async def post_init(app):
     await run_web_app()
 
 
+async def weekly_autopost(context: ContextTypes.DEFAULT_TYPE):
+    """Runs daily; posts the weekly summary once a week (Mondays).
+    Sends to every chat that had plays in the last 7 days."""
+    import datetime
+    # only fire on Mondays (weekday()==0)
+    if datetime.datetime.now().weekday() != 0:
+        return
+    chats = active_chats(days=7)
+    for chat_id in chats:
+        rows = week_top(chat_id, days=7, limit=10)
+        if not rows:
+            continue
+        try:
+            await context.bot.send_message(chat_id=int(chat_id), text=format_week(rows))
+        except Exception as e:
+            log.info("weekly_autopost to %s failed: %s", chat_id, e)
+
+
 def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("play", play))
+    application.add_handler(CommandHandler("week", week))
     application.add_handler(CommandHandler("reset_scores", reset_scores))
     application.add_handler(CommandHandler("reset_all", reset_all))
     application.add_handler(CallbackQueryHandler(game_callback))
     application.post_init = post_init
+
+    # schedule the weekly auto-post check: run daily at 12:00 server time
+    try:
+        import datetime
+        application.job_queue.run_daily(
+            weekly_autopost,
+            time=datetime.time(hour=12, minute=0),
+        )
+    except Exception as e:
+        log.warning("Could not schedule weekly auto-post: %s", e)
+
     application.run_polling()
 
 
